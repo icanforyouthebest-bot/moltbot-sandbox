@@ -1,0 +1,108 @@
+name: CF Cert Cleanup - Delete Unnecessary Advanced Certs
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'list'
+        type: choice
+        options:
+          - list
+          - delete-pet
+          - delete-api
+          - delete-both
+
+jobs:
+  cert-cleanup:
+    runs-on: ubuntu-latest
+    env:
+      CF_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+      CF_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+      ZONE_ID: "6ccc178e08857196d14f7fa22a26b2e5"
+    steps:
+      - name: List all certificate packs
+        id: list
+        run: |
+          echo "===== Listing all certificate packs ====="
+          RESPONSE=$(curl -s "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/ssl/certificate_packs?status=all" \
+            -H "X-Auth-Email: ${CF_EMAIL}" \
+            -H "X-Auth-Key: ${CF_API_KEY}" \
+            -H "Content-Type: application/json")
+          
+          echo "$RESPONSE" | jq '.result[] | {id, type, status, hosts, certificate_authority}' 2>/dev/null || echo "$RESPONSE"
+          
+          # Extract cert IDs for pet and api wildcards
+          PET_ID=$(echo "$RESPONSE" | jq -r '.result[] | select(.hosts[]? | contains("*.pet.aiforseo.vip")) | .id' 2>/dev/null)
+          API_ID=$(echo "$RESPONSE" | jq -r '.result[] | select(.hosts[]? | contains("*.api.aiforseo.vip")) | .id' 2>/dev/null)
+          
+          echo ""
+          echo "===== Target certs ====="
+          echo "*.pet.aiforseo.vip cert ID: ${PET_ID:-NOT_FOUND}"
+          echo "*.api.aiforseo.vip cert ID: ${API_ID:-NOT_FOUND}"
+          
+          echo "pet_id=${PET_ID}" >> $GITHUB_OUTPUT
+          echo "api_id=${API_ID}" >> $GITHUB_OUTPUT
+
+      - name: Delete *.pet.aiforseo.vip cert
+        if: inputs.action == 'delete-pet' || inputs.action == 'delete-both'
+        run: |
+          PET_ID="${{ steps.list.outputs.pet_id }}"
+          if [ -z "$PET_ID" ] || [ "$PET_ID" = "null" ]; then
+            echo "ERROR: *.pet cert not found"
+            exit 1
+          fi
+          echo "Deleting cert: $PET_ID"
+          curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/ssl/certificate_packs/${PET_ID}" \
+            -H "X-Auth-Email: ${CF_EMAIL}" \
+            -H "X-Auth-Key: ${CF_API_KEY}" \
+            -H "Content-Type: application/json" | jq .
+
+      - name: Delete *.api.aiforseo.vip cert
+        if: inputs.action == 'delete-api' || inputs.action == 'delete-both'
+        run: |
+          API_ID="${{ steps.list.outputs.api_id }}"
+          if [ -z "$API_ID" ] || [ "$API_ID" = "null" ]; then
+            echo "ERROR: *.api cert not found"
+            exit 1
+          fi
+          echo "Deleting cert: $API_ID"
+          curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/ssl/certificate_packs/${API_ID}" \
+            -H "X-Auth-Email: ${CF_EMAIL}" \
+            -H "X-Auth-Key: ${CF_API_KEY}" \
+            -H "Content-Type: application/json" | jq .
+
+      - name: Verify remaining certs
+        if: inputs.action != 'list'
+        run: |
+          echo "===== Remaining certificate packs ====="
+          sleep 5
+          curl -s "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/ssl/certificate_packs?status=all" \
+            -H "X-Auth-Email: ${CF_EMAIL}" \
+            -H "X-Auth-Key: ${CF_API_KEY}" \
+            -H "Content-Type: application/json" | jq '.result[] | {id, type, status, hosts}'
+
+      - name: Check for stale _acme-challenge TXT records
+        run: |
+          echo "===== Checking _acme-challenge TXT records ====="
+          RECORDS=$(curl -s "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=TXT&per_page=100" \
+            -H "X-Auth-Email: ${CF_EMAIL}" \
+            -H "X-Auth-Key: ${CF_API_KEY}" \
+            -H "Content-Type: application/json")
+          
+          echo "$RECORDS" | jq '.result[] | select(.name | contains("_acme-challenge")) | {id, name, content}' 2>/dev/null
+          
+          ACME_COUNT=$(echo "$RECORDS" | jq '[.result[] | select(.name | contains("_acme-challenge"))] | length' 2>/dev/null)
+          echo "Found ${ACME_COUNT:-0} _acme-challenge records"
+          
+          if [ "${ACME_COUNT:-0}" -gt "0" ]; then
+            echo "Cleaning up stale _acme-challenge records..."
+            echo "$RECORDS" | jq -r '.result[] | select(.name | contains("_acme-challenge")) | .id' | while read RECORD_ID; do
+              echo "Deleting TXT record: $RECORD_ID"
+              curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID}" \
+                -H "X-Auth-Email: ${CF_EMAIL}" \
+                -H "X-Auth-Key: ${CF_API_KEY}" \
+                -H "Content-Type: application/json" | jq .success
+            done
+          fi
