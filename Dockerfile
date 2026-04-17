@@ -5,15 +5,23 @@ FROM docker.io/cloudflare/sandbox:0.7.20
 # Using direct binary download for reliability
 # Note: rclone is no longer needed — persistence uses Sandbox SDK backup/restore API
 ENV NODE_VERSION=22.22.1
+
+# Use retries + timeout for apt to handle flaky GHA Docker network
+# Also pre-install xz-utils from base if available, then fall back to apt
+RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries \
+    && echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends xz-utils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN ARCH="$(dpkg --print-architecture)" \
     && case "${ARCH}" in \
          amd64) NODE_ARCH="x64" ;; \
          arm64) NODE_ARCH="arm64" ;; \
          *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;; \
        esac \
-    && apt-get update && apt-get install -y xz-utils ca-certificates \
     && rm -rf /usr/local/lib/node_modules /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
-    && curl -fsSLk https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz -o /tmp/node.tar.xz \
+    && curl -fsSLk --retry 3 --retry-delay 5 https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz -o /tmp/node.tar.xz \
     && rm -rf /usr/local/lib/node_modules /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm /tmp/node.tar.xz \
@@ -36,7 +44,7 @@ RUN mkdir -p /home/openclaw/.openclaw \
     && ln -s /home/openclaw/clawd /root/clawd
 
 # Copy startup script
-# Build cache bust: 2026-04-17-v33-fix-crlf
+# Build cache bust: 2026-04-17-v34-fix-apt-retry
 COPY start-openclaw.sh /usr/local/bin/start-openclaw.sh
 RUN sed -i 's/\r$//' /usr/local/bin/start-openclaw.sh \
     && chmod +x /usr/local/bin/start-openclaw.sh
